@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../../../.."
+		}
+    ],
+    "settings": {
+        "python-envs.defaultEnvManager": "ms-python.python:system",
+        "files.associations": {
+            "*.env.example": "properties",
+            "*.env.*": "properties",
+            "Dockerfile*": "dockerfile"
+        },
+        "terminal.integrated.defaultProfile.windows": "PowerShell",
+        "git.autoRepositoryDetection": "subFolders"
+    }
+}

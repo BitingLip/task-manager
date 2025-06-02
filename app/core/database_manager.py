@@ -245,6 +245,289 @@ class TaskDatabaseManager:
             'by_status': {r['status']: r for r in results}
         }
 
+    # Phase 2A: Advanced Task Analytics & Metrics Methods
+    
+    async def get_task_analytics(self, hours_back: int = 24) -> Dict[str, Any]:
+        """Get comprehensive task analytics for the specified time period"""
+        query = """
+        SELECT 
+            COUNT(*) as total_tasks,
+            COUNT(*) FILTER (WHERE status = 'completed') as completed_tasks,
+            COUNT(*) FILTER (WHERE status = 'failed') as failed_tasks,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending_tasks,
+            COUNT(*) FILTER (WHERE status = 'started') as running_tasks,
+            AVG(actual_duration) FILTER (WHERE actual_duration IS NOT NULL) as avg_duration_seconds,
+            MAX(actual_duration) FILTER (WHERE actual_duration IS NOT NULL) as max_duration_seconds,
+            MIN(actual_duration) FILTER (WHERE actual_duration IS NOT NULL) as min_duration_seconds,
+            AVG(retry_count) as avg_retries,
+            COUNT(DISTINCT worker_id) FILTER (WHERE worker_id IS NOT NULL) as active_workers
+        FROM tasks 
+        WHERE created_at >= NOW() - INTERVAL '%s hours'
+        """
+        
+        result = await self.fetch_one(query, hours_back)
+        
+        # Get hourly breakdown
+        hourly_query = """
+        SELECT * FROM task_statistics 
+        WHERE hour >= NOW() - INTERVAL '%s hours'
+        ORDER BY hour DESC
+        LIMIT 48
+        """
+        
+        hourly_stats = await self.execute_query(hourly_query, hours_back)
+        
+        return {
+            'summary': dict(result) if result else {},
+            'hourly_breakdown': hourly_stats,
+            'period_hours': hours_back
+        }
+    
+    async def get_task_metrics_by_task(self, task_id: str) -> List[Dict[str, Any]]:
+        """Get all metrics for a specific task"""
+        query = """
+        SELECT metric_name, metric_value, metric_unit, recorded_at, metadata
+        FROM task_metrics 
+        WHERE task_id = $1 
+        ORDER BY recorded_at DESC
+        """
+        return await self.execute_query(query, task_id)
+    
+    async def get_performance_metrics(self, metric_name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get performance metrics, optionally filtered by metric name"""
+        if metric_name:
+            query = """
+            SELECT t.id, t.type, t.status, tm.metric_name, tm.metric_value, 
+                   tm.metric_unit, tm.recorded_at, t.worker_id
+            FROM task_metrics tm
+            JOIN tasks t ON tm.task_id = t.id
+            WHERE tm.metric_name = $1
+            ORDER BY tm.recorded_at DESC
+            LIMIT $2
+            """
+            return await self.execute_query(query, metric_name, limit)
+        else:
+            query = """
+            SELECT t.id, t.type, t.status, tm.metric_name, tm.metric_value, 
+                   tm.metric_unit, tm.recorded_at, t.worker_id
+            FROM task_metrics tm
+            JOIN tasks t ON tm.task_id = t.id
+            ORDER BY tm.recorded_at DESC
+            LIMIT $1
+            """
+            return await self.execute_query(query, limit)
+    
+    async def add_task_execution_log(self, task_id: str, log_level: str, message: str, 
+                                   worker_id: str = None, step_name: str = None,
+                                   metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Add task execution log entry"""
+        query = """
+        INSERT INTO task_execution_logs (task_id, log_level, message, worker_id, step_name, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        """
+        try:
+            await self.execute_command(
+                query, task_id, log_level, message, worker_id, step_name,
+                json.dumps(metadata or {})
+            )
+            return True
+        except Exception as e:
+            logger.error("Failed to add task execution log", task_id=task_id, error=str(e))
+            return False
+    
+    async def get_task_execution_logs(self, task_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get execution logs for a task"""
+        query = """
+        SELECT log_level, message, timestamp, worker_id, step_name, metadata
+        FROM task_execution_logs 
+        WHERE task_id = $1 
+        ORDER BY timestamp DESC 
+        LIMIT $2
+        """
+        return await self.execute_query(query, task_id, limit)
+    
+    # Phase 2B: Task Dependencies & Advanced Queuing
+    
+    async def add_task_dependency(self, task_id: str, dependency_task_id: str, 
+                                dependency_type: str = "requires_completion") -> bool:
+        """Add a task dependency relationship"""
+        query = """
+        INSERT INTO task_dependencies (task_id, dependency_task_id, dependency_type)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (task_id, dependency_task_id) DO NOTHING
+        """
+        try:
+            await self.execute_command(query, task_id, dependency_task_id, dependency_type)
+            return True
+        except Exception as e:
+            logger.error("Failed to add task dependency", task_id=task_id, 
+                        dependency_task_id=dependency_task_id, error=str(e))
+            return False
+    
+    async def get_task_dependencies(self, task_id: str) -> List[Dict[str, Any]]:
+        """Get all dependencies for a task"""
+        query = """
+        SELECT td.dependency_task_id, td.dependency_type, td.created_at,
+               t.status as dependency_status, t.type as dependency_type_name
+        FROM task_dependencies td
+        JOIN tasks t ON td.dependency_task_id = t.id
+        WHERE td.task_id = $1
+        ORDER BY td.created_at
+        """
+        return await self.execute_query(query, task_id)
+    
+    async def get_ready_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get tasks that are ready to run (all dependencies satisfied)"""
+        query = """
+        SELECT t.* FROM tasks t
+        WHERE t.status = 'pending'
+        AND NOT EXISTS (
+            SELECT 1 FROM task_dependencies td
+            JOIN tasks dep_task ON td.dependency_task_id = dep_task.id
+            WHERE td.task_id = t.id
+            AND dep_task.status NOT IN ('completed', 'skipped')
+        )
+        ORDER BY t.priority DESC, t.created_at ASC
+        LIMIT $1
+        """
+        return await self.execute_query(query, limit)
+    
+    async def assign_task_to_worker(self, task_id: str, worker_id: str, 
+                                  estimated_completion: Optional[datetime] = None,
+                                  assignment_score: float = 0.0) -> bool:
+        """Assign a task to a worker"""
+        query = """
+        INSERT INTO worker_assignments (worker_id, task_id, estimated_completion, assignment_score)
+        VALUES ($1, $2, $3, $4)
+        """
+        try:
+            await self.execute_command(query, worker_id, task_id, estimated_completion, assignment_score)
+            # Also update the task's worker_id
+            await self.execute_command("UPDATE tasks SET worker_id = $1 WHERE id = $2", worker_id, task_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to assign task to worker", task_id=task_id, 
+                        worker_id=worker_id, error=str(e))
+            return False
+    
+    async def get_worker_assignments(self, worker_id: str = None, active_only: bool = True) -> List[Dict[str, Any]]:
+        """Get worker assignments, optionally filtered by worker"""
+        base_query = """
+        SELECT wa.*, t.type, t.status, t.priority, t.created_at as task_created_at
+        FROM worker_assignments wa
+        JOIN tasks t ON wa.task_id = t.id
+        """
+        
+        conditions = []
+        params = []
+        param_count = 0
+        
+        if worker_id:
+            param_count += 1
+            conditions.append(f"wa.worker_id = ${param_count}")
+            params.append(worker_id)
+            
+        if active_only:
+            conditions.append("t.status IN ('pending', 'started', 'running')")
+        
+        if conditions:
+            base_query += " WHERE " + " AND ".join(conditions)
+            
+        base_query += " ORDER BY wa.assigned_at DESC"
+        
+        return await self.execute_query(base_query, *params)
+    
+    async def get_worker_performance(self, worker_id: str, hours_back: int = 24) -> Dict[str, Any]:
+        """Get performance metrics for a specific worker"""
+        query = """
+        SELECT 
+            COUNT(*) as total_tasks,
+            COUNT(*) FILTER (WHERE status = 'completed') as completed_tasks,
+            COUNT(*) FILTER (WHERE status = 'failed') as failed_tasks,
+            AVG(actual_duration) FILTER (WHERE actual_duration IS NOT NULL) as avg_duration_seconds,
+            AVG(retry_count) as avg_retries,
+            MIN(started_at) as first_task,
+            MAX(completed_at) as last_completed
+        FROM tasks 
+        WHERE worker_id = $1 
+        AND created_at >= NOW() - INTERVAL '%s hours'
+        """
+        
+        result = await self.fetch_one(query, worker_id, hours_back)
+        return dict(result) if result else {}
+    
+    # Phase 2C: Enhanced Task Operations
+    
+    async def update_task_with_status_history(self, task_id: str, new_status: str, 
+                                            changed_by: str = "system", reason: str = None,
+                                            **kwargs) -> bool:
+        """Update task status with audit trail"""
+        # Get current status first
+        current_task = await self.get_task(task_id)
+        if not current_task:
+            return False
+            
+        old_status = current_task.get('status')
+        
+        # Update the task
+        success = await self.update_task_status(task_id, new_status, **kwargs)
+        
+        if success:
+            # Add status history record
+            history_query = """
+            INSERT INTO task_status_history (task_id, old_status, new_status, changed_by, reason)
+            VALUES ($1, $2, $3, $4, $5)
+            """
+            try:
+                await self.execute_command(history_query, task_id, old_status, new_status, changed_by, reason)
+            except Exception as e:
+                logger.warning("Failed to record status history", task_id=task_id, error=str(e))
+        
+        return success
+    
+    async def get_task_status_history(self, task_id: str) -> List[Dict[str, Any]]:
+        """Get status change history for a task"""
+        query = """
+        SELECT old_status, new_status, changed_at, changed_by, reason, metadata
+        FROM task_status_history 
+        WHERE task_id = $1 
+        ORDER BY changed_at DESC
+        """
+        return await self.execute_query(query, task_id)
+    
+    async def cancel_task(self, task_id: str, reason: str = "User cancelled", 
+                         cancelled_by: str = "system") -> bool:
+        """Cancel a task with proper status tracking"""
+        return await self.update_task_with_status_history(
+            task_id, "cancelled", changed_by=cancelled_by, reason=reason,
+            completed_at=datetime.utcnow()
+        )
+    
+    async def retry_failed_task(self, task_id: str, max_retries: int = None) -> bool:
+        """Retry a failed task"""
+        current_task = await self.get_task(task_id)
+        if not current_task:
+            return False
+            
+        current_retries = current_task.get('retry_count', 0)
+        task_max_retries = max_retries or current_task.get('max_retries', 3)
+        
+        if current_retries >= task_max_retries:
+            logger.warning("Task exceeded max retries", task_id=task_id, 
+                          retries=current_retries, max_retries=task_max_retries)
+            return False
+        
+        # Reset task to pending and increment retry count
+        return await self.update_task_with_status_history(
+            task_id, "pending", 
+            changed_by="retry_system", 
+            reason=f"Retry attempt {current_retries + 1}",
+            retry_count=current_retries + 1,
+            started_at=None,
+            completed_at=None,
+            error_message=None
+        )
+
 
 # Global database manager instance
 db_manager = TaskDatabaseManager()

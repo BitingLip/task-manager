@@ -15,23 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'common'))
 from app.core.database_manager import TaskDatabaseManager
 
 # Import models
-try:
-    from common.models import TaskType, TaskStatus
-except ImportError:
-    # Fallback to local definitions
-    from enum import Enum
-    
-    class TaskType(str, Enum):
-        LLM = "llm"
-        TTS = "tts"
-        STABLE_DIFFUSION = "stable_diffusion"
-        IMAGE_TO_TEXT = "image_to_text"
-
-    class TaskStatus(str, Enum):
-        PENDING = "pending"
-        STARTED = "started"
-        SUCCESS = "success"
-        FAILURE = "failure"
+from common.models import TaskType, TaskStatus
 
 async def test_database_integration():
     """Test Task Manager database integration"""
@@ -128,9 +112,9 @@ async def test_database_integration():
         # Test 6: Get task statistics
         print("\n📈 Test 6: Get Task Statistics")
         stats = await db_manager.get_task_statistics()
-        print(f"✅ Task Statistics:")
+        print("✅ Task Statistics:")
         print(f"   Total tasks: {stats['total_tasks']}")
-        print(f"   By status:")
+        print("   By status:")
         for status, info in stats['by_status'].items():
             print(f"     {status}: {info['count']} tasks")
             

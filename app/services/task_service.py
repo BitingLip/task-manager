@@ -560,3 +560,208 @@ class TaskService:
                 
         # Fallback to memory storage
         return self.tasks_db.get(task_id)
+    
+    # Phase 2A: Task Analytics & Metrics Methods
+    
+    async def get_task_analytics(self, hours_back: int = 24) -> Dict[str, Any]:
+        """Get comprehensive task analytics"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_task_analytics(hours_back)
+            except Exception as e:
+                logger.error("Failed to get analytics from database", error=str(e))
+        
+        # Fallback to basic memory stats
+        total_tasks = len(self.tasks_db)
+        completed = sum(1 for t in self.tasks_db.values() if t.get('status') == 'completed')
+        failed = sum(1 for t in self.tasks_db.values() if t.get('status') == 'failed')
+        
+        return {
+            'summary': {
+                'total_tasks': total_tasks,
+                'completed_tasks': completed,
+                'failed_tasks': failed,
+                'success_rate': completed / total_tasks if total_tasks > 0 else 0
+            },
+            'period_hours': hours_back
+        }
+    
+    async def add_task_metric(self, task_id: str, metric_name: str, metric_value: float,
+                             metric_unit: str = "", metadata: Dict[str, Any] = None) -> bool:
+        """Add performance metric for a task"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.add_task_metric(
+                    task_id, metric_name, metric_value, metric_unit, metadata
+                )
+            except Exception as e:
+                logger.error("Failed to add task metric", task_id=task_id, error=str(e))
+        
+        return False
+    
+    async def get_task_metrics(self, task_id: str) -> List[Dict[str, Any]]:
+        """Get all metrics for a specific task"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_task_metrics_by_task(task_id)
+            except Exception as e:
+                logger.error("Failed to get task metrics", task_id=task_id, error=str(e))
+        
+        return []
+    
+    async def get_performance_metrics(self, metric_name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get performance metrics across all tasks"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_performance_metrics(metric_name, limit)
+            except Exception as e:
+                logger.error("Failed to get performance metrics", error=str(e))
+        
+        return []
+    
+    # Phase 2B: Task Dependencies & Worker Management
+    
+    async def add_task_dependency(self, task_id: str, dependency_task_id: str, 
+                                 dependency_type: str = "requires_completion") -> bool:
+        """Add a dependency relationship between tasks"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.add_task_dependency(
+                    task_id, dependency_task_id, dependency_type
+                )
+            except Exception as e:
+                logger.error("Failed to add task dependency", task_id=task_id, 
+                           dependency_task_id=dependency_task_id, error=str(e))
+        
+        return False
+    
+    async def get_task_dependencies(self, task_id: str) -> List[Dict[str, Any]]:
+        """Get all dependencies for a task"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_task_dependencies(task_id)
+            except Exception as e:
+                logger.error("Failed to get task dependencies", task_id=task_id, error=str(e))
+        
+        return []
+    
+    async def get_ready_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get tasks that are ready to run (all dependencies satisfied)"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_ready_tasks(limit)
+            except Exception as e:
+                logger.error("Failed to get ready tasks", error=str(e))
+        
+        # Fallback to pending tasks without dependency checking
+        return [t for t in self.tasks_db.values() if t.get('status') == 'pending'][:limit]
+    
+    async def assign_task_to_worker(self, task_id: str, worker_id: str, 
+                                   estimated_completion: Optional[datetime] = None,
+                                   assignment_score: float = 0.0) -> bool:
+        """Assign a task to a specific worker"""
+        if self.db_manager:
+            try:
+                success = await self.db_manager.assign_task_to_worker(
+                    task_id, worker_id, estimated_completion, assignment_score
+                )
+                if success:
+                    logger.info("Task assigned to worker", task_id=task_id, worker_id=worker_id)
+                return success
+            except Exception as e:
+                logger.error("Failed to assign task to worker", task_id=task_id, 
+                           worker_id=worker_id, error=str(e))
+        
+        return False
+    
+    async def get_worker_performance(self, worker_id: str, hours_back: int = 24) -> Dict[str, Any]:
+        """Get performance metrics for a specific worker"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_worker_performance(worker_id, hours_back)
+            except Exception as e:
+                logger.error("Failed to get worker performance", worker_id=worker_id, error=str(e))
+        
+        return {}
+    
+    # Phase 2C: Enhanced Task Operations
+    
+    async def cancel_task(self, task_id: str, reason: str = "User cancelled", 
+                         cancelled_by: str = "api") -> bool:
+        """Cancel a task with proper tracking"""
+        if self.db_manager:
+            try:
+                # Use the database manager's cancel method with audit trail
+                success = await self.db_manager.cancel_task(task_id, reason, cancelled_by)
+                if success:
+                    logger.info("Task cancelled", task_id=task_id, reason=reason)
+                    
+                    # Try to cancel in Celery if it's running
+                    try:
+                        # This would need the Celery task ID, which we'd need to store
+                        # For now, just log the cancellation
+                        logger.info("Task marked as cancelled", task_id=task_id)
+                    except Exception as celery_error:
+                        logger.warning("Failed to cancel task in Celery", 
+                                     task_id=task_id, error=str(celery_error))
+                
+                return success
+            except Exception as e:
+                logger.error("Failed to cancel task", task_id=task_id, error=str(e))
+        else:
+            # Fallback to memory
+            if task_id in self.tasks_db:
+                self.tasks_db[task_id]['status'] = 'cancelled'
+                self.tasks_db[task_id]['completed_at'] = datetime.utcnow()
+                return True
+        
+        return False
+    
+    async def retry_task(self, task_id: str) -> bool:
+        """Retry a failed task"""
+        if self.db_manager:
+            try:
+                success = await self.db_manager.retry_failed_task(task_id)
+                if success:
+                    logger.info("Task scheduled for retry", task_id=task_id)
+                    
+                    # Re-dispatch the task
+                    task_data = await self._get_task_data(task_id)
+                    if task_data:
+                        # Create a new TaskRequest from the stored data
+                        task_request = TaskRequest(
+                            task_type=TaskType(task_data['type']),
+                            model_name=task_data['model_id'],
+                            input_data=task_data['input_data'].get('input_data', {}),
+                            parameters=task_data['input_data'].get('parameters', {}),
+                            priority=task_data.get('priority', 5)
+                        )
+                        
+                        # Dispatch to worker
+                        await self._dispatch_to_worker(task_id, task_request)
+                
+                return success
+            except Exception as e:
+                logger.error("Failed to retry task", task_id=task_id, error=str(e))
+        
+        return False
+    
+    async def get_task_status_history(self, task_id: str) -> List[Dict[str, Any]]:
+        """Get status change history for a task"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_task_status_history(task_id)
+            except Exception as e:
+                logger.error("Failed to get task status history", task_id=task_id, error=str(e))
+        
+        return []
+    
+    async def get_task_execution_logs(self, task_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get execution logs for a task"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_task_execution_logs(task_id, limit)
+            except Exception as e:
+                logger.error("Failed to get task execution logs", task_id=task_id, error=str(e))
+        
+        return []
