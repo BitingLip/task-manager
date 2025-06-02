@@ -30,9 +30,11 @@ logger = get_logger(__name__)
 class TaskService:
     """Central orchestrator for task management and execution via Celery workers"""
     
-    def __init__(self, settings):
+    def __init__(self, settings, db_manager=None):
         self.settings = settings
-        # In-memory storage for now (will be replaced with proper database)
+        self.db_manager = db_manager
+        
+        # Legacy in-memory storage (for fallback if no database)
         self.tasks_db: Dict[str, Dict[str, Any]] = {}
         self.worker_assignments: Dict[str, WorkerAssignment] = {}
         
@@ -114,8 +116,7 @@ class TaskService:
             logger.info("Routing task to optimal worker", 
                        task_id=task_id, 
                        worker=optimal_worker, 
-                       task_type=task_request.task_type)
-        
+                       task_type=task_request.task_type)        
         # Send task to worker
         result = self.celery_app.send_task(
             celery_task_name,
@@ -124,7 +125,7 @@ class TaskService:
         )
         
         return result
-        
+    
     async def create_task(self, task_request: TaskRequest) -> TaskResponse:
         """Create and dispatch a new task to cluster workers"""
         task_id = generate_task_id()
@@ -133,74 +134,114 @@ class TaskService:
         if task_request.task_type not in self.task_type_mapping:
             raise ValueError(f"Unsupported task type: {task_request.task_type}")
         
-        task = {
-            "task_id": task_id,
-            "task_type": task_request.task_type,
-            "model_name": task_request.model_name,
-            "input_data": task_request.input_data,
-            "parameters": task_request.parameters or {},
+        task_data = {
+            "id": task_id,
+            "type": task_request.task_type.value,
+            "status": TaskStatus.PENDING.value,
             "priority": task_request.priority or 5,
-            "timeout": task_request.timeout or 300,
-            "status": TaskStatus.PENDING,
+            "model_id": task_request.model_name,
+            "input_data": {
+                "input_data": task_request.input_data,
+                "parameters": task_request.parameters or {}
+            },
             "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
-            "result": None,
-            "error": None,
-            "worker_id": None,
-            "celery_task_id": None
+            "timeout_seconds": task_request.timeout or 300,
+            "max_retries": 3,
+            "metadata": {
+                "original_request": task_request.dict() if hasattr(task_request, 'dict') else {}
+            }
         }
         
-        self.tasks_db[task_id] = task
+        # Store task in database or fallback to memory
+        if self.db_manager:
+            try:
+                await self.db_manager.create_task(task_data)
+                logger.info("Task stored in database", task_id=task_id)
+            except Exception as e:
+                logger.error("Failed to store task in database, using memory fallback", 
+                           task_id=task_id, error=str(e))
+                self.tasks_db[task_id] = task_data
+        else:
+            self.tasks_db[task_id] = task_data
         
         logger.info("Task created", task_id=task_id, task_type=task_request.task_type)
-          # Dispatch task to cluster workers via Celery
+        
+        # Dispatch task to cluster workers via Celery
         try:
             celery_task_result = await self._dispatch_to_worker(task_id, task_request)
-            task["celery_task_id"] = celery_task_result.id
-            task["status"] = TaskStatus.STARTED
-            task["updated_at"] = datetime.utcnow()
+            
+            # Update task status in database
+            if self.db_manager:
+                await self.db_manager.update_task_status(
+                    task_id, 
+                    TaskStatus.STARTED.value,
+                    started_at=datetime.utcnow()
+                )
+            else:
+                task_data["status"] = TaskStatus.STARTED.value
+                task_data["started_at"] = datetime.utcnow()
             
             logger.info("Task dispatched to worker", task_id=task_id, celery_task_id=celery_task_result.id)
             
         except Exception as e:
-            task["status"] = TaskStatus.FAILURE
-            task["error"] = str(e)
-            task["updated_at"] = datetime.utcnow()
+            # Update task status to failure
+            if self.db_manager:
+                await self.db_manager.update_task_status(
+                    task_id,
+                    TaskStatus.FAILURE.value,
+                    error_message=str(e)
+                )
+            else:
+                task_data["status"] = TaskStatus.FAILURE.value
+                task_data["error_message"] = str(e)
             
             logger.error("Failed to dispatch task", task_id=task_id, error=str(e))
+          # Get current task data for response
+        current_task = await self._get_task_data(task_id)
+        if not current_task:
+            logger.error("Task data not found after creation", task_id=task_id)
+            # Return basic response with task_data as fallback
+            current_task = task_data
         
         return TaskResponse(
             task_id=task_id,
-            status=task["status"],
-            task_type=task_request.task_type,
-            model_name=task_request.model_name,
-            created_at=task["created_at"],
-            started_at=task["updated_at"] if task["status"] == TaskStatus.STARTED else None,
-            error=task["error"]
+            status=TaskStatus(current_task["status"]),
+            task_type=task_request.task_type,            model_name=task_request.model_name,
+            created_at=current_task["created_at"],
+            started_at=current_task.get("started_at"),
+            error=current_task.get("error_message")
         )
     
     async def get_task(self, task_id: str) -> Optional[TaskResponse]:
         """Get task details with real-time status from Celery"""
-        if task_id not in self.tasks_db:
+        task = await self._get_task_data(task_id)
+        if not task:
             return None
-            
-        task = self.tasks_db[task_id]
         
-        # Update task status from Celery if available
+        # Ensure task is not None and has required fields
+        if not isinstance(task, dict):
+            logger.error("Invalid task data type", task_id=task_id, task_type=type(task))
+            return None
+        
+        # Update task status from Celery if available (for legacy tasks)
         if task.get("celery_task_id"):
             await self._update_task_status(task_id)
+            # Refresh task data after update
+            task = await self._get_task_data(task_id)
+            if not task:
+                return None
         
         return TaskResponse(
             task_id=task_id,
-            status=task["status"],
-            task_type=task["task_type"],
-            model_name=task["model_name"],
+            status=TaskStatus(task["status"]),
+            task_type=TaskType(task.get("type", task.get("task_type", "text_generation"))),
+            model_name=task.get("model_id", task.get("model_name", "unknown")),
             created_at=task["created_at"],
             started_at=task.get("started_at"),
             completed_at=task.get("completed_at"),
             worker_id=task.get("worker_id"),
-            result=task.get("result"),
-            error=task.get("error")
+            result=task.get("output_data", task.get("result")),
+            error=task.get("error_message", task.get("error"))
         )
     
     async def _update_task_status(self, task_id: str) -> None:
@@ -507,3 +548,15 @@ class TaskService:
             logger.info("Task assigned to optimal worker", task_id=task_id, worker=optimal_worker)
         else:
             logger.warning("No optimal worker found, using default routing", task_id=task_id)
+    
+    async def _get_task_data(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get task data from database or memory fallback"""
+        if self.db_manager:
+            try:
+                return await self.db_manager.get_task(task_id)
+            except Exception as e:
+                logger.error("Failed to get task from database, using memory fallback", 
+                           task_id=task_id, error=str(e))
+                
+        # Fallback to memory storage
+        return self.tasks_db.get(task_id)

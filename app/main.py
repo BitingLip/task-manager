@@ -20,9 +20,12 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'common'))
 
 from .core.config import get_settings
-from .core.logging_config import setup_logging
+from .core.logging_config import setup_logging, get_logger
+from .core.database_manager import db_manager, initialize_database, close_database
 from .routes import tasks, health
 from .services.task_service import TaskService
+
+logger = get_logger(__name__)
 
 
 def get_task_service(request: Request) -> TaskService:
@@ -37,18 +40,28 @@ async def lifespan(app: FastAPI):
     
     # Setup logging
     setup_logging(settings)
+    logger.info("Starting Task Manager", version="1.0.0")
     
-    # Initialize services
-    task_service = TaskService(settings)
+    # Initialize database manager
+    await initialize_database(settings)
+    app.state.db_manager = db_manager
+    logger.info("Database manager initialized")
+    
+    # Initialize services with database
+    task_service = TaskService(settings, db_manager)
     await task_service.initialize()
     
     # Store services in app state for dependency injection
     app.state.task_service = task_service
+    logger.info("Task service initialized")
     
     yield
     
     # Cleanup on shutdown
+    logger.info("Shutting down Task Manager")
     await task_service.cleanup()
+    await close_database()
+    logger.info("Task Manager shutdown complete")
 
 
 def create_app() -> FastAPI:
