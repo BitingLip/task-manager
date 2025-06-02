@@ -354,39 +354,66 @@ class TaskService:
             old_status=old_status, 
             new_status=status,
             worker_id=worker_id
-        )
-        
+        )        
         return task
         
-    async def cancel_task(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Cancel a pending or running task via Celery revoke"""
-        if task_id not in self.tasks_db:
-            return None
-            
-        task = self.tasks_db[task_id]
-        
-        if task["status"] in [TaskStatus.SUCCESS, TaskStatus.FAILURE]:
-            return None  # Cannot cancel completed tasks
-            
-        # Revoke the Celery task if it exists
-        if task.get("celery_task_id"):
+    async def cancel_task(self, task_id: str, reason: str = "User cancelled", 
+                         cancelled_by: str = "api") -> bool:
+        """Cancel a task with proper tracking and audit trail"""
+        if self.db_manager:
             try:
-                self.celery_app.control.revoke(
-                    task["celery_task_id"], 
-                    terminate=True,  # Kill running task
-                    signal='SIGKILL'
-                )
-                logger.info("Celery task revoked", task_id=task_id, celery_task_id=task["celery_task_id"])
-            except Exception as e:
-                logger.error("Failed to revoke Celery task", task_id=task_id, error=str(e))
+                # Use the database manager's cancel method with audit trail
+                success = await self.db_manager.cancel_task(task_id, reason, cancelled_by)
+                if success:
+                    logger.info("Task cancelled", task_id=task_id, reason=reason)
+                    
+                    # Try to cancel in Celery if it's running
+                    try:
+                        # Get task info to find Celery task ID
+                        task = await self.get_task(task_id)
+                        if task and task.get("celery_task_id"):
+                            self.celery_app.control.revoke(
+                                task["celery_task_id"], 
+                                terminate=True,
+                                signal='SIGKILL'
+                            )
+                            logger.info("Celery task revoked", task_id=task_id, 
+                                      celery_task_id=task["celery_task_id"])
+                    except Exception as celery_error:
+                        logger.warning("Failed to cancel task in Celery", 
+                                     task_id=task_id, error=str(celery_error))
                 
-        task["status"] = TaskStatus.REVOKED
-        task["updated_at"] = datetime.utcnow()
-        task["completed_at"] = datetime.utcnow()
+                return success
+            except Exception as e:
+                logger.error("Failed to cancel task", task_id=task_id, error=str(e))
+        else:
+            # Fallback to memory
+            if task_id in self.tasks_db:
+                task = self.tasks_db[task_id]
+                
+                # Check if task can be cancelled
+                if task["status"] in [TaskStatus.SUCCESS, TaskStatus.FAILURE]:
+                    return False  # Cannot cancel completed tasks
+                    
+                # Revoke the Celery task if it exists
+                if task.get("celery_task_id"):
+                    try:
+                        self.celery_app.control.revoke(
+                            task["celery_task_id"], 
+                            terminate=True,
+                            signal='SIGKILL'
+                        )
+                        logger.info("Celery task revoked", task_id=task_id, 
+                                  celery_task_id=task["celery_task_id"])
+                    except Exception as e:
+                        logger.error("Failed to revoke Celery task", task_id=task_id, error=str(e))
+                
+                task['status'] = TaskStatus.REVOKED
+                task['completed_at'] = datetime.utcnow()
+                task['updated_at'] = datetime.utcnow()
+                return True
         
-        logger.info("Task cancelled", task_id=task_id)
-        
-        return task
+        return False
     
     async def delete_task(self, task_id: str) -> bool:
         """Delete a task"""
@@ -561,6 +588,10 @@ class TaskService:
         # Fallback to memory storage
         return self.tasks_db.get(task_id)
     
+    async def get_analytics_data(self, hours_back: int = 24) -> Dict[str, Any]:
+        """Alias for get_task_analytics for API compatibility"""
+        return await self.get_task_analytics(hours_back)
+    
     # Phase 2A: Task Analytics & Metrics Methods
     
     async def get_task_analytics(self, hours_back: int = 24) -> Dict[str, Any]:
@@ -583,11 +614,10 @@ class TaskService:
                 'failed_tasks': failed,
                 'success_rate': completed / total_tasks if total_tasks > 0 else 0
             },
-            'period_hours': hours_back
-        }
+            'period_hours': hours_back        }
     
     async def add_task_metric(self, task_id: str, metric_name: str, metric_value: float,
-                             metric_unit: str = "", metadata: Dict[str, Any] = None) -> bool:
+                             metric_unit: str = "", metadata: Optional[Dict[str, Any]] = None) -> bool:
         """Add performance metric for a task"""
         if self.db_manager:
             try:
@@ -609,7 +639,7 @@ class TaskService:
         
         return []
     
-    async def get_performance_metrics(self, metric_name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_performance_metrics(self, metric_name: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """Get performance metrics across all tasks"""
         if self.db_manager:
             try:
@@ -683,39 +713,7 @@ class TaskService:
                 logger.error("Failed to get worker performance", worker_id=worker_id, error=str(e))
         
         return {}
-    
-    # Phase 2C: Enhanced Task Operations
-    
-    async def cancel_task(self, task_id: str, reason: str = "User cancelled", 
-                         cancelled_by: str = "api") -> bool:
-        """Cancel a task with proper tracking"""
-        if self.db_manager:
-            try:
-                # Use the database manager's cancel method with audit trail
-                success = await self.db_manager.cancel_task(task_id, reason, cancelled_by)
-                if success:
-                    logger.info("Task cancelled", task_id=task_id, reason=reason)
-                    
-                    # Try to cancel in Celery if it's running
-                    try:
-                        # This would need the Celery task ID, which we'd need to store
-                        # For now, just log the cancellation
-                        logger.info("Task marked as cancelled", task_id=task_id)
-                    except Exception as celery_error:
-                        logger.warning("Failed to cancel task in Celery", 
-                                     task_id=task_id, error=str(celery_error))
-                
-                return success
-            except Exception as e:
-                logger.error("Failed to cancel task", task_id=task_id, error=str(e))
-        else:
-            # Fallback to memory
-            if task_id in self.tasks_db:
-                self.tasks_db[task_id]['status'] = 'cancelled'
-                self.tasks_db[task_id]['completed_at'] = datetime.utcnow()
-                return True
-        
-        return False
+      # Phase 2C: Enhanced Task Operations
     
     async def retry_task(self, task_id: str) -> bool:
         """Retry a failed task"""
