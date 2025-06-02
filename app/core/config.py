@@ -1,69 +1,110 @@
 """
 Task Manager Configuration
-
-MIGRATION NOTICE: This file has been migrated to use centralized configuration.
-The new configuration adapter provides backward compatibility while enabling
-centralized configuration management across the BitingLip platform.
+Uses the new distributed configuration system for microservice independence.
 """
 
-# Import from centralized configuration system
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../config'))
+from pathlib import Path
 
-from central_config import get_config
-from service_discovery import ServiceDiscovery
+# Add the project root to Python path to access config package
+project_root = Path(__file__).parent.parent.parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# Import from the config package (avoid circular imports)
+from config.distributed_config import load_service_config, load_infrastructure_config
+from config.service_discovery import ServiceDiscovery
 
 class TaskManagerSettings:
-    """Task Manager specific configuration adapter"""
+    """Task Manager specific configuration adapter using distributed config"""
     
     def __init__(self):
-        self.config = get_config('task_manager')
-        self.service_discovery = ServiceDiscovery()
+        # Load service-specific configuration
+        self.config = load_service_config('task-manager', 'manager')
+        
+        # Load infrastructure configuration for shared resources
+        self.infrastructure = load_infrastructure_config()
+        
+        # Initialize service discovery
+        try:
+            self.service_discovery = ServiceDiscovery()
+        except Exception as e:
+            print(f"Warning: Could not initialize service discovery: {e}")
+            self.service_discovery = None
+    
+    def get_config_value(self, key: str, default: str = '') -> str:
+        """Get configuration value with fallback to environment variables"""
+        return self.config.get(key, os.getenv(key, default))
     
     @property
     def host(self):
-        return self.config.task_manager_host
+        return self.get_config_value('TASK_MANAGER_HOST', 'localhost')
     
     @property 
     def port(self):
-        return self.config.task_manager_port
+        return int(self.get_config_value('TASK_MANAGER_PORT', '8003'))
     
     @property
     def debug(self):
-        return self.config.debug
+        return self.get_config_value('DEBUG', 'true').lower() == 'true'
     
     @property
     def cors_origins(self):
-        return self.config.cors_origins
+        origins = self.get_config_value('CORS_ORIGINS', 'http://localhost:3000,http://localhost:5173')
+        return [origin.strip() for origin in origins.split(',')]
     
     @property
     def log_format(self):
-        return getattr(self.config, 'log_format', 'standard')
+        return self.get_config_value('LOG_FORMAT', 'standard')
     
     @property
     def log_level(self):
-        return getattr(self.config, 'log_level', 'INFO')
+        return self.get_config_value('LOG_LEVEL', 'INFO')
     
     @property
     def celery_broker_url(self):
-        return getattr(self.config, 'celery_broker_url', 'redis://localhost:6379/0')
+        return self.get_config_value('CELERY_BROKER_URL', 'redis://localhost:6379/0')
     
     @property
     def celery_result_backend(self):
-        return getattr(self.config, 'celery_result_backend', 'redis://localhost:6379/0')
+        return self.get_config_value('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
     
     @property
     def redis_url(self):
-        return getattr(self.config, 'redis_url', 'redis://localhost:6379/0')
+        return self.get_config_value('REDIS_URL', 'redis://localhost:6379/0')
     
     @property
     def cluster_manager_url(self):
-        return f"http://{self.config.cluster_manager_host}:{self.config.cluster_manager_port}"
+        host = self.get_config_value('CLUSTER_MANAGER_HOST', 'localhost')
+        port = self.get_config_value('CLUSTER_MANAGER_PORT', '8002')
+        return f"http://{host}:{port}"
     
     @property
     def model_manager_url(self):
-        return f"http://{self.config.model_manager_host}:{self.config.model_manager_port}"
+        host = self.get_config_value('MODEL_MANAGER_HOST', 'localhost')
+        port = self.get_config_value('MODEL_MANAGER_PORT', '8001')
+        return f"http://{host}:{port}"
+    
+    @property
+    def db_host(self):
+        return self.get_config_value('TASK_DB_HOST', 'localhost')
+    
+    @property
+    def db_port(self):
+        return int(self.get_config_value('TASK_DB_PORT', '5432'))
+    
+    @property
+    def db_name(self):
+        return self.get_config_value('TASK_DB_NAME', 'bitinglip_tasks')
+    
+    @property
+    def db_user(self):
+        return self.get_config_value('TASK_DB_USER', 'bitinglip')
+    
+    @property
+    def db_password(self):
+        return self.get_config_value('TASK_DB_PASSWORD', 'secure_password')
 
 def get_settings():
     """Get task manager settings instance"""
@@ -71,8 +112,7 @@ def get_settings():
 
 def reload_settings():
     """Reload configuration from file"""
-    from central_config import reload_config
-    reload_config()
+    # With distributed config, create a new instance to reload configs
     return get_settings()
 
 # Create default instance
