@@ -10,6 +10,14 @@ from contextlib import asynccontextmanager
 import structlog
 from datetime import datetime
 import os
+import sys
+
+# Add project root to path to access common module
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from common.models import TaskResponse, TaskStatus, TaskType
 
 # Import settings (will implement after creating the file)
 # from app.core.config import settings
@@ -85,7 +93,7 @@ class TaskDatabaseManager:
                 'port': os.getenv('POSTGRES_PORT', '5432'),
                 'database': os.getenv('POSTGRES_DB', 'bitinglip_tasks')
             }
-        except:
+        except Exception:
             return {'host': 'unknown', 'port': 'unknown', 'database': 'unknown'}
     
     async def _initialize_schema(self):
@@ -100,6 +108,10 @@ class TaskDatabaseManager:
                 with open(schema_path, 'r') as f:
                     schema_sql = f.read()
                 
+                if not self.pool:
+                    logger.error("Database pool is not initialized, cannot initialize schema")
+                    return
+
                 async with self.pool.acquire() as conn:
                     await conn.execute(schema_sql)
                     
@@ -186,7 +198,6 @@ class TaskDatabaseManager:
         updates = ["status = $2"]
         values = [task_id, status]
         param_count = 2
-        
         for field, value in kwargs.items():
             if field in ['started_at', 'completed_at', 'output_data', 'error_message', 'worker_id']:
                 param_count += 1
@@ -211,6 +222,73 @@ class TaskDatabaseManager:
         LIMIT $1
         """
         return await self.execute_query(query, limit)
+    
+    async def list_tasks(self, 
+                        status: Optional[str] = None,
+                        task_type: Optional[str] = None,
+                        limit: int = 100,
+                        offset: int = 0) -> List[TaskResponse]:
+        """List tasks with optional filtering and pagination"""
+        
+        # Build dynamic query with filters
+        conditions = []
+        params = []
+        param_count = 0
+        
+        if status:
+            param_count += 1
+            conditions.append(f"status = ${param_count}")
+            params.append(status)
+        
+        if task_type:
+            param_count += 1
+            conditions.append(f"type = ${param_count}")
+            params.append(task_type)
+        
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+        
+        param_count += 1
+        limit_param = f"${param_count}"
+        params.append(limit)
+        
+        param_count += 1
+        offset_param = f"${param_count}"
+        params.append(offset)
+        
+        query = f"""
+        SELECT id, type, status, priority, model_id, worker_id, 
+               input_data, output_data, error_message, 
+               created_at, started_at, completed_at, metadata
+        FROM tasks 
+        {where_clause}
+        ORDER BY created_at DESC 
+        LIMIT {limit_param} OFFSET {offset_param}
+        """
+        
+        try:
+            rows = await self.execute_query(query, *params)
+            tasks = []
+            
+            for row in rows:
+                task_response = TaskResponse(
+                    task_id=row['id'],
+                    status=TaskStatus(row['status']),
+                    task_type=TaskType(row['type']),
+                    model_name=row['model_id'] or 'unknown',
+                    created_at=row['created_at'],
+                    started_at=row.get('started_at'),
+                    completed_at=row.get('completed_at'),
+                    worker_id=row.get('worker_id'),
+                    result=row.get('output_data'),
+                    error=row.get('error_message')
+                )
+                tasks.append(task_response)
+            
+            return tasks
+        
+        except Exception as e:
+            logger.error("Failed to list tasks", error=str(e))
+            return []
     
     async def add_task_metric(self, task_id: str, metric_name: str, metric_value: float,
                              metric_unit: str = "", metadata: Optional[Dict[str, Any]] = None) -> bool:
@@ -293,7 +371,7 @@ class TaskDatabaseManager:
         """
         return await self.execute_query(query, task_id)
     
-    async def get_performance_metrics(self, metric_name: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_performance_metrics(self, metric_name: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """Get performance metrics, optionally filtered by metric name"""
         if metric_name:
             query = """
@@ -318,7 +396,7 @@ class TaskDatabaseManager:
             return await self.execute_query(query, limit)
     
     async def add_task_execution_log(self, task_id: str, log_level: str, message: str, 
-                                   worker_id: str = None, step_name: str = None,
+                                   worker_id: Optional[str] = None, step_name: Optional[str] = None,
                                    metadata: Optional[Dict[str, Any]] = None) -> bool:
         """Add task execution log entry"""
         query = """
@@ -410,7 +488,7 @@ class TaskDatabaseManager:
                         worker_id=worker_id, error=str(e))
             return False
     
-    async def get_worker_assignments(self, worker_id: str = None, active_only: bool = True) -> List[Dict[str, Any]]:
+    async def get_worker_assignments(self, worker_id: Optional[str] = None, active_only: bool = True) -> List[Dict[str, Any]]:
         """Get worker assignments, optionally filtered by worker"""
         base_query = """
         SELECT wa.*, t.type, t.status, t.priority, t.created_at as task_created_at
@@ -420,10 +498,10 @@ class TaskDatabaseManager:
         
         conditions = []
         params = []
-        param_count = 0
         
+        param_count = 0
         if worker_id:
-            param_count += 1
+            param_count = 1
             conditions.append(f"wa.worker_id = ${param_count}")
             params.append(worker_id)
             
@@ -459,7 +537,7 @@ class TaskDatabaseManager:
     # Phase 2C: Enhanced Task Operations
     
     async def update_task_with_status_history(self, task_id: str, new_status: str, 
-                                            changed_by: str = "system", reason: str = None,
+                                            changed_by: str = "system", reason: Optional[str] = None,
                                             **kwargs) -> bool:
         """Update task status with audit trail"""
         # Get current status first
@@ -498,12 +576,13 @@ class TaskDatabaseManager:
     async def cancel_task(self, task_id: str, reason: str = "User cancelled", 
                          cancelled_by: str = "system") -> bool:
         """Cancel a task with proper status tracking"""
+        from datetime import timezone
         return await self.update_task_with_status_history(
             task_id, "cancelled", changed_by=cancelled_by, reason=reason,
-            completed_at=datetime.utcnow()
+            completed_at=datetime.now(timezone.utc)
         )
     
-    async def retry_failed_task(self, task_id: str, max_retries: int = None) -> bool:
+    async def retry_failed_task(self, task_id: str, max_retries: Optional[int] = None) -> bool:
         """Retry a failed task"""
         current_task = await self.get_task(task_id)
         if not current_task:
@@ -526,10 +605,8 @@ class TaskDatabaseManager:
             started_at=None,
             completed_at=None,
             error_message=None
-        )
-
-
-# Global database manager instance
+        )    
+  # Global database manager instance
 db_manager = TaskDatabaseManager()
 
 

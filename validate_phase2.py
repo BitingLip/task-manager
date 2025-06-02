@@ -22,7 +22,7 @@ sys.path.insert(0, str(common_path))
 sys.path.insert(0, str(task_manager_path))
 
 # Import after path setup
-from app.core.database_manager import db_manager as TaskDatabaseManager
+from app.core.database_manager import TaskDatabaseManager, db_manager
 from app.core.config import get_settings
 from app.services.task_service import TaskService
 
@@ -34,7 +34,7 @@ async def validate_database_connection():
     logger.info("🔍 Testing database connection...")
     
     try:
-        db_manager = TaskDatabaseManager()
+        # Use the global db_manager instance
         await db_manager.initialize()
         
         # Test basic database connectivity
@@ -61,11 +61,12 @@ async def validate_phase2_methods():
     logger.info("🔍 Validating Phase 2 method availability...")
     
     try:
-        # Initialize services
-        db_manager = TaskDatabaseManager()
-        await db_manager.initialize()
+        # Use global db_manager, ensure it's initialized
+        if not db_manager.pool:
+            await db_manager.initialize()
         
-        task_service = TaskService()
+        # Create task service with settings (no settings required for basic check)
+        task_service = TaskService(settings=None)
         task_service.db_manager = db_manager
         
         # Check database manager methods
@@ -137,31 +138,32 @@ async def validate_database_schema():
         db_manager = TaskDatabaseManager()
         await db_manager.initialize()
         
-        # Check for Phase 2 tables
-        phase2_tables = [
-            'task_dependencies',
-            'task_metrics', 
-            'task_execution_logs',
-            'task_status_history',
-            'worker_assignments'
-        ]
-        
-        async with db_manager.pool.acquire() as conn:
-            for table_name in phase2_tables:
-                result = await conn.fetchval("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_schema = 'public' 
-                        AND table_name = $1
-                    );
-                """, table_name)
-                
-                if result:
-                    logger.info(f"  ✅ Table {table_name} exists")
-                else:
-                    logger.error(f"  ❌ Table {table_name} missing")
+        if db_manager.pool:
+            phase2_tables = [
+                'task_dependencies',
+                'task_metrics', 
+                'task_execution_logs',
+                'task_status_history',
+                'worker_assignments'
+            ]
+            async with db_manager.pool.acquire() as conn:
+                for table_name in phase2_tables:
+                    result = await conn.fetchval("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_schema = 'public' 
+                            AND table_name = $1
+                        );
+                    """, table_name)
                     
-        return True
+                    if result:
+                        logger.info(f"  ✅ Table {table_name} exists")
+                    else:
+                        logger.error(f"  ❌ Table {table_name} missing")
+            return True
+        else:
+            logger.error("❌ Database connection pool not initialized")
+            return False
         
     except Exception as e:
         logger.error(f"❌ Schema validation failed: {e}")
@@ -174,6 +176,10 @@ async def test_phase2_database_operations():
     try:
         db_manager = TaskDatabaseManager()
         await db_manager.initialize()
+        
+        if not db_manager.pool:
+            logger.error("❌ Database connection pool not initialized")
+            return False
         
         # Create a test task first
         test_task_id = f"test-task-{int(datetime.now().timestamp())}"
@@ -207,15 +213,19 @@ async def test_phase2_database_operations():
         
         # Test execution log
         log_added = await db_manager.add_task_execution_log(
-            test_task_id, "info", "Test log message", {"test": True}
+            test_task_id,
+            log_level="INFO",
+            message="Test execution log entry"
         )
         logger.info(f"✅ Execution log added: {log_added}")
-        
+
         # Cleanup test task
-        async with db_manager.pool.acquire() as conn:
-            await conn.execute("DELETE FROM tasks WHERE task_id = $1", test_task_id)
-            
-        logger.info(f"✅ Cleaned up test task: {test_task_id}")
+        if db_manager.pool:
+            async with db_manager.pool.acquire() as conn:
+                await conn.execute("DELETE FROM tasks WHERE task_id = $1", test_task_id)
+            logger.info(f"✅ Cleaned up test task: {test_task_id}")
+        else:
+            logger.warning("⚠️  Could not clean up test task because pool is not initialized")
         
         return True
         
@@ -253,7 +263,7 @@ async def main():
     logger.info("📊 VALIDATION SUMMARY")
     logger.info("=" * 50)
     
-    passed = sum(1 for result in results.values() if result)
+    passed = list(results.values()).count(True)
     total = len(results)
     
     for test_name, result in results.items():

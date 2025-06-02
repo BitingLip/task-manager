@@ -3,7 +3,7 @@ Task Service - Central orchestrator for task management and execution
 """
 
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import asyncio
 import sys
@@ -73,8 +73,7 @@ class TaskService:
         # Test Celery connection
         try:
             inspector = self.celery_app.control.inspect()
-            stats = inspector.stats()
-            if stats:
+            if stats := inspector.stats():
                 logger.info("Connected to Celery workers", worker_count=len(stats))
             else:
                 logger.warning("No Celery workers found")
@@ -118,13 +117,11 @@ class TaskService:
                        worker=optimal_worker, 
                        task_type=task_request.task_type)        
         # Send task to worker
-        result = self.celery_app.send_task(
+        return self.celery_app.send_task(
             celery_task_name,
             args=[task_payload],
             **routing_options
         )
-        
-        return result
     
     async def create_task(self, task_request: TaskRequest) -> TaskResponse:
         """Create and dispatch a new task to cluster workers"""
@@ -144,7 +141,7 @@ class TaskService:
                 "input_data": task_request.input_data,
                 "parameters": task_request.parameters or {}
             },
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
             "timeout_seconds": task_request.timeout or 300,
             "max_retries": 3,
             "metadata": {
@@ -175,11 +172,11 @@ class TaskService:
                 await self.db_manager.update_task_status(
                     task_id, 
                     TaskStatus.STARTED.value,
-                    started_at=datetime.utcnow()
+                    started_at=datetime.now(timezone.utc)
                 )
             else:
                 task_data["status"] = TaskStatus.STARTED.value
-                task_data["started_at"] = datetime.utcnow()
+                task_data["started_at"] = datetime.now(timezone.utc)
             
             logger.info("Task dispatched to worker", task_id=task_id, celery_task_id=celery_task_result.id)
             
@@ -269,52 +266,66 @@ class TaskService:
             # Only update if status changed
             if task["status"] != new_status:
                 task["status"] = new_status
-                task["updated_at"] = datetime.utcnow()
+                task["updated_at"] = datetime.now(timezone.utc)
                 
                 if new_status == TaskStatus.SUCCESS:
-                    task["completed_at"] = datetime.utcnow()
+                    task["completed_at"] = datetime.now(timezone.utc)
                     task["result"] = celery_result.result
                 elif new_status == TaskStatus.FAILURE:
-                    task["completed_at"] = datetime.utcnow()
+                    task["completed_at"] = datetime.now(timezone.utc)
                     task["error"] = str(celery_result.info)
                     
                 logger.info("Task status updated", task_id=task_id, status=new_status)
                 
         except Exception as e:
-            logger.error("Failed to update task status", task_id=task_id, error=str(e))
-        
+            logger.error("Failed to update task status", task_id=task_id, error=str(e))        
     async def list_tasks(self, 
                         status: Optional[TaskStatus] = None,
                         task_type: Optional[TaskType] = None,
                         limit: int = 100,
                         offset: int = 0) -> List[TaskResponse]:
         """List tasks with optional filtering"""
+        if self.db_manager:
+            # Use database manager for task listing with filters
+            try:
+                return await self.db_manager.list_tasks(
+                    status=status.value if status else None,
+                    task_type=task_type.value if task_type else None,
+                    limit=limit,
+                    offset=offset
+                )
+            except Exception as e:
+                logger.error("Failed to list tasks from database", error=str(e))
+                # Fall back to in-memory if database fails
+        
+        # Fallback to in-memory storage
         tasks = []
         
         for task_data in self.tasks_db.values():
             # Apply filters
-            if status and task_data["status"] != status:
+            if status and task_data.get("status") != status.value:
                 continue
-            if task_type and task_data["task_type"] != task_type:
+            if task_type and task_data.get("task_type") != task_type.value:
                 continue
                 
             task_response = TaskResponse(
-                task_id=task_data["task_id"],
-                status=task_data["status"],
-                task_type=task_data["task_type"],
-                model_name=task_data["model_name"],
-                created_at=task_data["created_at"],
+                task_id=str(task_data.get("task_id") or task_data.get("id") or ""),
+                status=TaskStatus(task_data.get("status", "pending")),
+                task_type=TaskType(task_data.get("task_type", task_data.get("type", "llm"))),
+                model_name=task_data.get("model_name", task_data.get("model_id", "unknown")),
+                created_at=task_data.get("created_at", datetime.now(timezone.utc)),
                 started_at=task_data.get("started_at"),
                 completed_at=task_data.get("completed_at"),
                 worker_id=task_data.get("worker_id"),
-                result=task_data.get("result"),
-                error=task_data.get("error")
+                result=task_data.get("result", task_data.get("output_data")),
+                error=task_data.get("error", task_data.get("error_message"))
             )
             tasks.append(task_response)
         
         # Sort by creation time (newest first)
         tasks.sort(key=lambda t: t.created_at, reverse=True)
-          # Apply pagination
+        
+        # Apply pagination
         return tasks[offset:offset + limit]
         
     async def update_task_status(self, 
@@ -331,13 +342,13 @@ class TaskService:
         old_status = task["status"]
         
         task["status"] = status
-        task["updated_at"] = datetime.utcnow()
+        task["updated_at"] = datetime.now(timezone.utc)
         
         if worker_id:
             task["worker_id"] = worker_id
             
         if status == TaskStatus.STARTED:
-            task["started_at"] = datetime.utcnow()
+            task["started_at"] = datetime.now(timezone.utc)
             
         if result:
             task["result"] = result
@@ -346,7 +357,7 @@ class TaskService:
             task["error"] = error
             
         if status in [TaskStatus.SUCCESS, TaskStatus.FAILURE]:
-            task["completed_at"] = datetime.utcnow()
+            task["completed_at"] = datetime.now(timezone.utc)
             
         logger.info(
             "Task status updated", 
@@ -371,14 +382,14 @@ class TaskService:
                     try:
                         # Get task info to find Celery task ID
                         task = await self.get_task(task_id)
-                        if task and task.get("celery_task_id"):
+                        if task and getattr(task, "celery_task_id", None):
                             self.celery_app.control.revoke(
-                                task["celery_task_id"], 
+                                getattr(task, "celery_task_id"), 
                                 terminate=True,
                                 signal='SIGKILL'
                             )
                             logger.info("Celery task revoked", task_id=task_id, 
-                                      celery_task_id=task["celery_task_id"])
+                                      celery_task_id=getattr(task, "celery_task_id"))
                     except Exception as celery_error:
                         logger.warning("Failed to cancel task in Celery", 
                                      task_id=task_id, error=str(celery_error))
@@ -386,32 +397,31 @@ class TaskService:
                 return success
             except Exception as e:
                 logger.error("Failed to cancel task", task_id=task_id, error=str(e))
-        else:
+        elif task_id in self.tasks_db:
             # Fallback to memory
-            if task_id in self.tasks_db:
-                task = self.tasks_db[task_id]
+            task = self.tasks_db[task_id]
+            
+            # Check if task can be cancelled
+            if task["status"] in [TaskStatus.SUCCESS, TaskStatus.FAILURE]:
+                return False  # Cannot cancel completed tasks
                 
-                # Check if task can be cancelled
-                if task["status"] in [TaskStatus.SUCCESS, TaskStatus.FAILURE]:
-                    return False  # Cannot cancel completed tasks
-                    
-                # Revoke the Celery task if it exists
-                if task.get("celery_task_id"):
-                    try:
-                        self.celery_app.control.revoke(
-                            task["celery_task_id"], 
-                            terminate=True,
-                            signal='SIGKILL'
-                        )
-                        logger.info("Celery task revoked", task_id=task_id, 
-                                  celery_task_id=task["celery_task_id"])
-                    except Exception as e:
-                        logger.error("Failed to revoke Celery task", task_id=task_id, error=str(e))
-                
-                task['status'] = TaskStatus.REVOKED
-                task['completed_at'] = datetime.utcnow()
-                task['updated_at'] = datetime.utcnow()
-                return True
+            # Revoke the Celery task if it exists
+            if task.get("celery_task_id"):
+                try:
+                    self.celery_app.control.revoke(
+                        task["celery_task_id"], 
+                        terminate=True,
+                        signal='SIGKILL'
+                    )
+                    logger.info("Celery task revoked", task_id=task_id, 
+                              celery_task_id=task["celery_task_id"])
+                except Exception as e:
+                    logger.error("Failed to revoke Celery task", task_id=task_id, error=str(e))
+            
+            task['status'] = TaskStatus.REVOKED
+            task['completed_at'] = datetime.now(timezone.utc)
+            task['updated_at'] = datetime.now(timezone.utc)
+            return True
         
         return False
     
@@ -604,8 +614,8 @@ class TaskService:
         
         # Fallback to basic memory stats
         total_tasks = len(self.tasks_db)
-        completed = sum(1 for t in self.tasks_db.values() if t.get('status') == 'completed')
-        failed = sum(1 for t in self.tasks_db.values() if t.get('status') == 'failed')
+        completed = 0
+        failed = 0
         
         return {
             'summary': {
@@ -614,7 +624,8 @@ class TaskService:
                 'failed_tasks': failed,
                 'success_rate': completed / total_tasks if total_tasks > 0 else 0
             },
-            'period_hours': hours_back        }
+            'period_hours': hours_back
+        }
     
     async def add_task_metric(self, task_id: str, metric_name: str, metric_value: float,
                              metric_unit: str = "", metadata: Optional[Dict[str, Any]] = None) -> bool:
